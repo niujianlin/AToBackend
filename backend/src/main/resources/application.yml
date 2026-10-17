@@ -1,0 +1,77 @@
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: ato-account
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://${DB_HOST:127.0.0.1}:${DB_PORT:3306}/${DB_NAME:ato_account}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:root}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DB:0}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+  jackson:
+    date-format: yyyy-MM-dd'T'HH:mm:ss'Z'
+    time-zone: UTC
+    default-property-inclusion: non_null
+    # 与 docs/openapi.yaml 保持一致：请求/响应字段统一 snake_case
+    property-naming-strategy: SNAKE_CASE
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: input
+
+ato:
+  jwt:
+    # 生产必须由环境变量/KMS 注入，长度 >= 32 字节
+    secret: ${JWT_SECRET:ato-dev-secret-key-please-change-32bytes-min}
+    issuer: ato-account
+    access-expire-seconds: 7200
+    refresh-expire-seconds: 2592000
+    # 刷新重放宽限窗口，用于并发/重试幂等
+    refresh-grace-seconds: 30
+  crypto:
+    # AES-256-GCM 密钥（base64 或原文，取 SHA-256 派生 32 字节）
+    aes-key: ${AES_KEY:ato-dev-aes-key-change-me}
+    key-id: ${AES_KEY_ID:k1}
+    # identifier 查询用 HMAC 密钥
+    hmac-key: ${IDENTIFIER_HMAC_KEY:ato-dev-hmac-key-change-me}
+  snowflake:
+    worker-id: ${SNOWFLAKE_WORKER_ID:1}
+  sms:
+    code-ttl-seconds: 300
+    cooldown-seconds: 60
+    daily-limit: 10
+    ip-hourly-limit: 20
+    device-hourly-limit: 20
+    max-verify-attempts: 5
+    # true=不真实发送，仅打印日志（MVP 默认）
+    mock: true
+  # 第三方登录开关，MVP 关闭；表结构与契约已预留
+  wechat:
+    enabled: false
+  apple:
+    enabled: false

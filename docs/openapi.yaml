@@ -1,0 +1,564 @@
+openapi: 3.0.3
+info:
+  title: 阿拓 v1.0.0 账号/登录域 API
+  version: 1.0.0
+  description: |
+    依据《v1.0.0 后端服务技术设计》+ docs/atot-backend-decisions.md 定稿。
+    通用约定：
+    - HTTP 状态码统一 200（框架级 400/404/500 例外），业务结果看 code
+    - 所有 int64 ID（user_id/session_id/credential_id）序列化为字符串
+    - 时间统一 ISO8601 UTC，如 2026-10-05T10:49:31Z
+    - 鉴权：Authorization: Bearer <access_token>
+servers:
+  - url: https://api.ato.example.com
+    description: 生产
+  - url: http://127.0.0.1:8080
+    description: 本地
+tags:
+  - name: Auth
+    description: 登录/绑定/注销
+  - name: Session
+    description: 会话与多设备
+  - name: User
+    description: 用户资料
+  - name: Internal
+    description: 服务间内部接口
+
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: 登录（含自动注册）
+      description: |
+        支持 wechat / apple / phone_code。凭证不存在则自动创建账号。
+        成功后写入 auth_session，并把该用户同 platform 的旧 session 全部 revoked=1（同端互踢）。
+      parameters:
+        - $ref: '#/components/parameters/PlatformHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/DeviceNameHeader'
+        - $ref: '#/components/parameters/ClientIpHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [auth_type, auth_code]
+              properties:
+                auth_type: {type: string, enum: [wechat, apple, phone_code]}
+                auth_code: {type: string, description: 第三方授权 code 或 identityToken；phone_code 场景填短信验证码}
+                phone: {type: string, description: 仅 auth_type=phone_code 必填}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResult'
+                  - type: object
+                    properties:
+                      data: {$ref: '#/components/schemas/LoginResult'}
+              example:
+                code: 0
+                msg: success
+                data:
+                  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  refresh_token: 9f2c1a7b4e6d8f0a1b2c3d4e5f607182
+                  access_expire: 7200
+                  refresh_expire: 2592000
+                  user_info:
+                    user_id: "1735891234567890123"
+                    nickname: 阿拓用户890123
+                    avatar: ""
+                    is_new_user: true
+      x-error-codes:
+        - {code: 40001, msg: "Authorization verification failed", desc: "第三方 code 无效/过期"}
+        - {code: 40002, msg: "Code expired", desc: "短信验证码错误或过期"}
+        - {code: 40003, msg: "Missing parameter: auth_type", desc: "必填字段为空"}
+        - {code: 40004, msg: "This account has been deactivated", desc: "账号已注销"}
+        - {code: 40005, msg: "The account has been banned", desc: "账号已封禁"}
+        - {code: 40006, msg: "The account is abnormal", desc: "账号异常"}
+        - {code: 40007, msg: "Third-party API call exception", desc: "第三方接口异常"}
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: 刷新 Token（原地续期）
+      description: |
+        无需 Authorization，凭 refresh_token 鉴权。
+        原地更新同一条 session，旧 token 立即失效。
+        旧 token 在 30s 宽限期内重复请求 → 幂等返回同一结果；超出宽限期重复 → 判定泄露，该用户全端 session 置 revoked=1。
+      parameters:
+        - $ref: '#/components/parameters/PlatformHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResult'
+                  - type: object
+                    properties:
+                      data: {$ref: '#/components/schemas/TokenPair'}
+              example:
+                code: 0
+                msg: success
+                data:
+                  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  refresh_token: 3c9d2e8f1a4b5c6d7e8f9a0b1c2d3e4f
+                  access_expire: 7200
+                  refresh_expire: 2592000
+      x-error-codes:
+        - {code: 40101, msg: "The refresh_token is invalid. Please log in again", desc: "不存在/已吊销/已过期/重放判定"}
+        - {code: 40102, msg: "Missing parameter: refresh_token", desc: "入参为空"}
+        - {code: 40103, msg: "This account has been deactivated", desc: "账号已注销"}
+        - {code: 40104, msg: "The account has been banned", desc: "账号已封禁"}
+        - {code: 40105, msg: "The account is abnormal", desc: "账号异常"}
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: 登出（仅销毁当前设备会话）
+      description: |
+        Authorization 与 body.refresh_token 至少提供一个，Header 优先。
+        两者都没有 → 40106；其余情况一律返回成功（客户端清空本地存储）。
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: {type: string, description: access_token 过期时使用}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40106, msg: "Missing authentication information", desc: "Header 无 token 且 body 也无 refresh_token"}
+        - {code: 40100, msg: "Not logged in or invalid token", desc: "未登录/Token 无效（不阻断登出成功语义）"}
+
+  /api/v1/auth/sms_code:
+    post:
+      tags: [Auth]
+      summary: 获取短信验证码
+      description: |
+        通用下发接口，scene 隔离（login/bind/change_phone），不同场景验证码不可混用。
+        限流：手机号+场景 60s 冷却、10 次/天；IP 与 device_id 各 20 次/小时。
+        仅下发，不校验账号是否存在。验证码 6 位数字，有效期 5 分钟。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone_number, scene]
+              properties:
+                phone_number: {type: string, example: '13800138000'}
+                scene: {type: string, enum: [login, bind, change_phone]}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40050, msg: "The phone number format is incorrect", desc: "手机号格式错误"}
+        - {code: 40051, msg: "The request is made too frequently. Please try again later", desc: "触发冷却或日/时限额"}
+        - {code: 40052, msg: "SMS sending failed", desc: "短信服务商异常"}
+
+  /api/v1/auth/bind:
+    post:
+      tags: [Auth]
+      summary: 绑定第三方 / 手机号
+      description: |
+        需登录态。第三方绑定由后端用 auth_code 换取 unionid/sub（禁止前端直传 identifier）。
+        绑定只新增 auth_credential，不新建账号、不新建会话、不踢设备。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [auth_type]
+              properties:
+                auth_type: {type: string, enum: [wechat, apple, phone_code]}
+                auth_code: {type: string, description: 第三方必填（微信 code / Apple identityToken）}
+                phone: {type: string, description: auth_type=phone_code 必填}
+                sms_code: {type: string, description: auth_type=phone_code 必填，scene=bind}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40020, msg: "This login method has already been bound to another account", desc: "该凭证属于其他账号"}
+        - {code: 40021, msg: "The current account has already been bound to this login method", desc: "本账号已绑定该凭证"}
+        - {code: 40041, msg: "The account has already bound a phone number", desc: "已绑定手机号，请走换绑接口"}
+        - {code: 40001, msg: "Authorization verification failed", desc: "第三方 code 无效/过期"}
+        - {code: 40002, msg: "Code expired", desc: "短信验证码错误或过期"}
+
+  /api/v1/auth/unbind:
+    post:
+      tags: [Auth]
+      summary: 解绑登录方式
+      description: |
+        需登录态。最后一条凭证禁止解绑；手机号允许解绑（前提是账号还有其它凭证）。
+        软删：is_invalid=1、identifier 清空、identifier_hash 改写为 dead_{id}，释放给其它账号绑定。
+        不影响当前会话，不踢下线。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [auth_type]
+              properties:
+                auth_type: {type: string, enum: [wechat, apple, phone_code]}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40030, msg: "The only login method of the account cannot be unbound", desc: "仅剩一条凭证"}
+        - {code: 40031, msg: "This login method is not bound to the current account", desc: "该方式不属于本账号"}
+  /api/v1/auth/change_phone:
+    post:
+      tags: [Auth]
+      summary: 手机号换绑
+      description: |
+        需登录态。MVP 只校验新手机号验证码（不校验旧手机号）。
+        成功后踢掉除当前 session 外的全部会话（安全加固），并释放旧手机号。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_phone_number, verification_code]
+              properties:
+                new_phone_number: {type: string, example: '13900139000'}
+                verification_code: {type: string, description: scene=change_phone 的验证码}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40061, msg: "Verification code error or expired", desc: "验证码校验失败"}
+        - {code: 40062, msg: "The account has not been bound to a phone number", desc: "无手机号凭证，应调用 bind"}
+        - {code: 40063, msg: "The new phone number has been bound to another account", desc: "新手机号冲突"}
+        - {code: 40064, msg: "The new phone number matches the currently bound phone number", desc: "重复设置"}
+
+  /api/v1/auth/logout_cancel:
+    post:
+      tags: [Auth]
+      summary: 账号注销
+      description: |
+        user_info 软删（account_status=3 + deleted_at）；全部 session revoked=1；
+        auth_credential 软删并释放 identifier（identifier 清空、hash 改写为 dead_{id}、is_invalid=1）。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40041, msg: "The account is already in a deactivated state", desc: "账号已处于注销状态"}
+        - {code: 40100, msg: "Not logged in or invalid token", desc: "未登录/Token 失效"}
+
+  /api/v1/auth/session/list:
+    get:
+      tags: [Session]
+      summary: 获取登录设备列表
+      description: |
+        仅返回 revoked=0 且 expire_at>now 的会话；按 device_id 去重（保留 updated_at 最新），
+        is_current 由 JWT 的 sid 比对得出。
+      security:
+        - bearerAuth: []
+      parameters:
+        - {name: page, in: query, schema: {type: integer, default: 1, minimum: 1}}
+        - {name: page_size, in: query, schema: {type: integer, default: 20, minimum: 1, maximum: 100}}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResult'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          total: {type: integer}
+                          session_list:
+                            type: array
+                            items: {$ref: '#/components/schemas/DeviceSession'}
+              example:
+                code: 0
+                msg: success
+                data:
+                  total: 2
+                  session_list:
+                    - session_id: "1735891234567890201"
+                      device_id: dev_abc123
+                      platform: mobile
+                      auth_type: wechat
+                      device_name: iPhone 15
+                      ip_addr: 113.xx.xx.xx
+                      created_at: 2026-10-05T10:49:31Z
+                      updated_at: 2026-10-05T10:49:31Z
+                      is_current: true
+                    - session_id: "1735891234567890202"
+                      device_id: dev_def456
+                      platform: desktop
+                      auth_type: wechat
+                      device_name: MacBook Pro
+                      ip_addr: 223.xx.xx.xx
+                      created_at: 2026-10-03T09:20:00Z
+                      updated_at: 2026-10-03T09:20:00Z
+                      is_current: false
+      x-error-codes:
+        - {code: 40100, msg: "Not logged in or invalid token", desc: "未登录/Token 失效"}
+        - {code: 40073, msg: "Failed to query the session list", desc: "后端内部异常"}
+
+  /api/v1/auth/session/revoke:
+    post:
+      tags: [Session]
+      summary: 踢下线指定设备
+      description: 需登录态。仅能吊销本账号的会话；禁止踢当前会话。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties:
+                session_id: {type: string, description: 目标会话 ID（字符串形式）}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40070, msg: "The session does not exist or does not belong to the current user", desc: "会话不存在或不属于当前用户"}
+        - {code: 40071, msg: "It is not allowed to revoke the current session", desc: "禁止踢当前会话"}
+        - {code: 40072, msg: "This session is already in a revoked state", desc: "会话已被吊销"}
+  /api/v1/auth/ai_verify:
+    post:
+      tags: [Internal]
+      summary: AI 服务鉴权校验（内部接口）
+      description: |
+        仅内网可达，供 AI 服务校验客户端令牌是否有效，并获取 user_id / session_id。
+        鉴权：Authorization: Bearer access_token + 服务间密钥（X-Internal-Token）。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResult'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user_id: {type: string}
+                          session_id: {type: string}
+                          is_valid: {type: boolean}
+              example:
+                code: 0
+                msg: success
+                data: {user_id: "1735891234567890123", session_id: "1735891234567890201", is_valid: true}
+      x-error-codes:
+        - {code: 40100, msg: "Not logged in or invalid token", desc: "未登录/Token 失效"}
+        - {code: 40004, msg: "This account has been deactivated", desc: "账号已注销"}
+
+  /api/v1/user/me:
+    get:
+      tags: [User]
+      summary: 获取当前用户资料
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResult'
+                  - type: object
+                    properties:
+                      data: {$ref: '#/components/schemas/UserProfile'}
+              example:
+                code: 0
+                msg: success
+                data:
+                  user_id: "1735891234567890123"
+                  nickname: 阿拓用户890123
+                  avatar: ""
+                  gender: 0
+                  bio: ""
+                  account_status: 1
+                  created_at: 2026-10-05T10:49:31Z
+      x-error-codes:
+        - {code: 40100, msg: "Not logged in or invalid token", desc: "未登录/Token 失效"}
+
+  /api/v1/user/profile/update:
+    post:
+      tags: [User]
+      summary: 更新用户资料
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nickname: {type: string, maxLength: 32}
+                avatar: {type: string, maxLength: 255}
+                gender: {type: integer, enum: [0, 1, 2]}
+                bio: {type: string, maxLength: 255}
+      responses:
+        '200':
+          description: 统一响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResult'
+              example: {code: 0, msg: success}
+      x-error-codes:
+        - {code: 40100, msg: "Not logged in or invalid token", desc: "未登录/Token 失效"}
+        - {code: 40081, msg: "Invalid profile field", desc: "字段校验失败"}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    PlatformHeader:
+      name: Platform
+      in: header
+      required: true
+      schema: {type: string, enum: [mobile, pad, web, desktop]}
+      description: 平台枚举，决定同端互踢范围
+    DeviceIdHeader:
+      name: X-Device-Id
+      in: header
+      required: true
+      schema: {type: string, maxLength: 128}
+    DeviceNameHeader:
+      name: X-Device-Name
+      in: header
+      required: false
+      schema: {type: string, maxLength: 128}
+    ClientIpHeader:
+      name: X-Client-Ip
+      in: header
+      required: false
+      schema: {type: string, maxLength: 64}
+      description: 客户端透传 IP，后端取不到真实 IP 时使用
+  schemas:
+    ApiResult:
+      type: object
+      required: [code, msg]
+      properties:
+        code: {type: integer, description: 0=成功，其余见各接口 x-error-codes}
+        msg: {type: string, example: success}
+        data: {type: object, nullable: true}
+    TokenPair:
+      type: object
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string, description: '随机的不可预测字符串（如 32 字节随机数的 hex），非 JWT'}
+        access_expire: {type: integer, example: 7200}
+        refresh_expire: {type: integer, example: 2592000}
+    LoginResult:
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          properties:
+            user_info:
+              type: object
+              properties:
+                user_id: {type: string}
+                nickname: {type: string}
+                avatar: {type: string}
+                is_new_user: {type: boolean}
+    DeviceSession:
+      type: object
+      properties:
+        session_id: {type: string}
+        device_id: {type: string}
+        platform: {type: string, enum: [mobile, pad, web, desktop]}
+        auth_type: {type: string}
+        device_name: {type: string}
+        ip_addr: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        is_current: {type: boolean}
+    UserProfile:
+      type: object
+      properties:
+        user_id: {type: string}
+        nickname: {type: string}
+        avatar: {type: string}
+        gender: {type: integer, enum: [0, 1, 2]}
+        bio: {type: string}
+        account_status: {type: integer, enum: [0, 1, 2, 3]}
+        created_at: {type: string, format: date-time}

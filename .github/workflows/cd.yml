@@ -1,0 +1,223 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '镜像标签（留空则用 git ref 名，如 v1.0.0）'
+        required: false
+        default: ''
+      skip_deploy:
+        description: '仅构建推送镜像，不部署'
+        type: boolean
+        default: false
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  JAVA_VERSION: '17'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ato-account
+  MAVEN_ARGS: '-B -ntp'
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  # ============================================================
+  # 1. 发布前校验：测试 + 打包，任何一步失败都不出镜像
+  # ============================================================
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Test & package
+        run: mvn ${{ env.MAVEN_ARGS }} clean verify
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-jar
+          path: backend/target/ato-account-*.jar
+          retention-days: 30
+
+  # ============================================================
+  # 2. 构建并推送容器镜像到 GHCR
+  # ============================================================
+  image:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: verify
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          REF_NAME="${{ github.event.inputs.image_tag }}"
+          if [ -z "$REF_NAME" ]; then
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              REF_NAME="${{ github.ref_name }}"
+            else
+              REF_NAME="sha-$(echo '${{ github.sha }}' | cut -c1-7)"
+            fi
+          fi
+          echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "使用镜像标签：$REF_NAME"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.meta.outputs.version }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ============================================================
+  # 3. 部署：SSH 到目标主机执行 docker compose 拉取重启
+  #    需要的 Secrets：DEPLOY_HOST / DEPLOY_USER / DEPLOY_SSH_KEY / DEPLOY_PATH
+  # ============================================================
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: [verify, image]
+    if: github.event.inputs.skip_deploy != 'true'
+    timeout-minutes: 15
+    # 保护规则（人工审批 / 仅允许 tag）在仓库 Settings → Environments 里配置
+    environment:
+      name: production
+    steps:
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+          missing=0
+          for k in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_PATH; do
+            if [ -z "${!k:-}" ]; then
+              echo "::error::缺少 secret: $k"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+
+      - name: Load SSH key into agent
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy via docker compose
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER_: ${{ secrets.DEPLOY_USER }}
+          PATH_: ${{ secrets.DEPLOY_PATH }}
+          VERSION: ${{ needs.image.outputs.version }}
+          REGISTRY_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$USER_@$HOST" bash -s -- "$PATH_" "$VERSION" "$REGISTRY_ACTOR" "$GHCR_TOKEN" "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"; VERSION="$2"; ACTOR="$3"; TOKEN="$4"; IMAGE="$5"
+
+          cd "$DEPLOY_PATH" || { echo "部署目录不存在: $DEPLOY_PATH"; exit 1; }
+
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+          export ATO_IMAGE="$IMAGE:$VERSION"
+          echo "部署版本: $ATO_IMAGE"
+
+          # 发布前备份当前运行镜像，便于回滚
+          docker compose ps --format '{{.Image}}' > .last_image 2>/dev/null || true
+
+          docker compose pull ato-account
+          docker compose up -d --no-deps ato-account
+
+          # 等待健康检查通过（最多 90s）
+          for i in $(seq 1 45); do
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' \
+              "$(docker compose ps -q ato-account)" 2>/dev/null || echo starting)
+            echo "[$i] health=$STATUS"
+            [ "$STATUS" = "healthy" ] && { echo "部署成功"; exit 0; }
+            [ "$STATUS" = "unhealthy" ] && break
+            sleep 2
+          done
+
+          echo "::error::健康检查未通过，输出最近日志"
+          docker compose logs --tail=100 ato-account
+          exit 1
+          REMOTE
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER_: ${{ secrets.DEPLOY_USER }}
+          PATH_: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$USER_@$HOST" bash -s -- "$PATH_" <<'REMOTE' || true
+          set -uo pipefail
+          cd "$1" || exit 0
+          PREV=$(cat .last_image 2>/dev/null | head -1 || true)
+          if [ -n "$PREV" ]; then
+            echo "回滚到: $PREV"
+            ATO_IMAGE="$PREV" docker compose up -d --no-deps ato-account
+          else
+            echo "无可用回滚点，仅保留失败版本日志"
+          fi
+          REMOTE

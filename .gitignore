@@ -1,0 +1,51 @@
+# ---------- Maven ----------
+target/
+*.jar
+*.war
+*.class
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+dependency-reduced-pom.xml
+
+# 例外：Maven Wrapper（若后续引入）
+!**/maven-wrapper.jar
+
+# ---------- 日志与运行时 ----------
+*.log
+logs/
+nohup.out
+hs_err_pid*.log
+
+# ---------- 密钥与本地环境（严禁入库） ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+secrets/
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+
+# ---------- 其他 ----------
+node_modules/
+__pycache__/
+*.pyc

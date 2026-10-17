@@ -1,0 +1,237 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+# 同一分支/PR 的重复推送取消旧任务，节省额度
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '17'
+  MAVEN_ARGS: '-B -ntp -Dstyle.color=never'
+
+# Maven 工程根目录是 backend/，所有 run 步骤默认在此执行
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  # ============================================================
+  # 1. 编译 + 单元测试
+  # ============================================================
+  build:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Show toolchain versions
+        run: java -version && mvn -version
+
+      - name: Compile
+        run: mvn ${{ env.MAVEN_ARGS }} -DskipTests clean compile
+
+      - name: Unit tests
+        run: mvn ${{ env.MAVEN_ARGS }} test
+
+      - name: Package (fat jar)
+        run: mvn ${{ env.MAVEN_ARGS }} -DskipTests package
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: backend/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ato-account-jar
+          path: backend/target/ato-account-*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  # ============================================================
+  # 2. 端到端冒烟：真实 MySQL 8 + Redis 7 起服务，跑登录全链路
+  #    对应 docs/smoke-test-report.md 的 12 项用例中的核心主干
+  # ============================================================
+  smoke:
+    name: E2E Smoke (MySQL + Redis)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: ato_account
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: '3306'
+      DB_NAME: ato_account
+      DB_USER: root
+      DB_PASSWORD: root
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: '6379'
+      JWT_SECRET: ci-only-jwt-secret-at-least-32-bytes-long
+      AES_KEY: ci-only-aes-key
+      IDENTIFIER_HMAC_KEY: ci-only-hmac-key
+      SNOWFLAKE_WORKER_ID: '7'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: ato-account-jar
+          path: backend/target
+        # 注意：download-artifact 的 path 相对仓库根目录
+
+      - name: Wait for MySQL & init schema
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -proot --silent 2>/dev/null; then
+              echo "MySQL is ready"; break
+            fi
+            echo "waiting for MySQL... ($i)"; sleep 2
+          done
+          mysql -h 127.0.0.1 -P 3306 -uroot -proot \
+            -e "CREATE DATABASE IF NOT EXISTS ato_account DEFAULT CHARSET utf8mb4;"
+          mysql -h 127.0.0.1 -P 3306 -uroot -proot ato_account \
+            < src/main/resources/db/schema.sql
+          mysql -h 127.0.0.1 -P 3306 -uroot -proot ato_account -e "SHOW TABLES;"
+
+      - name: Start application
+        run: |
+          set -euo pipefail
+          JAR=$(ls target/ato-account-*.jar | head -1)
+          echo "starting $JAR"
+          nohup java -jar "$JAR" > /tmp/app.log 2>&1 &
+          for i in $(seq 1 60); do
+            if grep -q "Started AtoAccountApplication" /tmp/app.log 2>/dev/null; then
+              echo "application started"; exit 0
+            fi
+            if grep -qE "APPLICATION FAILED TO START|BeanCreationException" /tmp/app.log 2>/dev/null; then
+              echo "::error::application failed to start"; tail -100 /tmp/app.log; exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::startup timeout"; tail -100 /tmp/app.log; exit 1
+
+      - name: E2E smoke test (login flow)
+        run: |
+          set -euo pipefail
+          BASE=http://127.0.0.1:8080
+          PHONE=13800138000
+          DEV=ci_dev_001
+
+          post() { curl -sS -X POST "$1" -H 'Content-Type: application/json' "${@:2}"; }
+          code_of() { python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
+
+          echo "== 1. sms_code =="
+          R=$(post "$BASE/api/v1/auth/sms_code" -H "X-Device-Id: $DEV" \
+               -d "{\"phone_number\":\"$PHONE\",\"scene\":\"login\"}")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "0" ]
+
+          CODE=$(grep '\[MOCK SMS\]' /tmp/app.log | tail -1 | sed -E 's/.*code=([0-9]{6}).*/\1/')
+          echo "mock code = $CODE"; [ -n "$CODE" ]
+
+          echo "== 2. login =="
+          R=$(post "$BASE/api/v1/auth/login" -H 'Platform: mobile' -H "X-Device-Id: $DEV" \
+               -H 'X-Device-Name: CI Runner' \
+               -d "{\"auth_type\":\"phone_code\",\"phone\":\"$PHONE\",\"auth_code\":\"$CODE\"}")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "0" ]
+
+          AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+          RT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["refresh_token"])')
+          NEW=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["user_info"]["is_new_user"])')
+          echo "is_new_user = $NEW"
+
+          echo "== 3. reuse consumed code (expect 40002) =="
+          R=$(post "$BASE/api/v1/auth/login" -H 'Platform: mobile' -H "X-Device-Id: $DEV" \
+               -d "{\"auth_type\":\"phone_code\",\"phone\":\"$PHONE\",\"auth_code\":\"$CODE\"}")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "40002" ]
+
+          echo "== 4. /user/me with token =="
+          R=$(curl -sS "$BASE/api/v1/user/me" -H "Authorization: Bearer $AT")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "0" ]
+
+          echo "== 5. /user/me without token (expect 40100) =="
+          R=$(curl -sS "$BASE/api/v1/user/me")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "40100" ]
+
+          echo "== 6. refresh =="
+          R=$(post "$BASE/api/v1/auth/refresh" -d "{\"refresh_token\":\"$RT\"}")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "0" ]
+          AT2=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+          RT2=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["refresh_token"])')
+
+          echo "== 7. session list =="
+          R=$(curl -sS "$BASE/api/v1/auth/session/list" -H "Authorization: Bearer $AT2")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "0" ]
+
+          echo "== 8. logout then old token must fail =="
+          R=$(post "$BASE/api/v1/auth/logout" -H "Authorization: Bearer $AT2" \
+               -d "{\"refresh_token\":\"$RT2\"}")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "0" ]
+          R=$(curl -sS "$BASE/api/v1/user/me" -H "Authorization: Bearer $AT2")
+          echo "$R"; [ "$(echo "$R" | code_of)" = "40100" ]
+
+          echo "== 9. data persisted =="
+          mysql -h 127.0.0.1 -P 3306 -uroot -proot ato_account -e \
+            "SELECT COUNT(*) AS users FROM user_info; SELECT COUNT(*) AS creds, SUM(is_invalid) AS invalid FROM auth_credential; SELECT COUNT(*) AS sessions, SUM(revoked) AS revoked FROM auth_session;"
+
+          echo "SMOKE PASS"
+
+      - name: Dump app log on failure
+        if: failure()
+        run: tail -200 /tmp/app.log || true
