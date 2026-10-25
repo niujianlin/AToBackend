@@ -1,6 +1,6 @@
 package com.ato.account.entity;
 
-import org.apache.ibatis.reflection.MetaClass;
+import org.apache.ibatis.reflection.Reflector;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -16,15 +16,15 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
  * insert/update 的动态 SQL（{@code <if test="revoked != null">}）构建失败，
  * 表现就是登录接口 500。
  *
- * <p>构造 MetaClass 会强制触发 Reflector 解析，因此用它做守卫。
+ * <p>构造 Reflector 会强制解析全部 getter/setter，因此用它做守卫。
  */
 class EntityGetterConflictTest {
 
     @Test
-    @DisplayName("实体构建 MetaClass 不得出现 getter 歧义")
-    void entityMetaClassShouldBeBuildable() {
-        assertDoesNotThrow(() -> new MetaClass(AuthSession.class), "AuthSession 存在歧义 getter");
-        assertDoesNotThrow(() -> new MetaClass(AuthCredential.class), "AuthCredential 存在歧义 getter");
-        assertDoesNotThrow(() -> new MetaClass(UserInfo.class), "UserInfo 存在歧义 getter");
+    @DisplayName("实体解析 Reflector 不得出现 getter 歧义")
+    void entityReflectorShouldBeBuildable() {
+        assertDoesNotThrow(() -> Reflector.forClass(AuthSession.class), "AuthSession 存在歧义 getter");
+        assertDoesNotThrow(() -> Reflector.forClass(AuthCredential.class), "AuthCredential 存在歧义 getter");
+        assertDoesNotThrow(() -> Reflector.forClass(UserInfo.class), "UserInfo 存在歧义 getter");
     }
 }
