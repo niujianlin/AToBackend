@@ -80,7 +80,7 @@ public class AuthInterceptor implements HandlerInterceptor {
         }
 
         AuthSession session = authSessionMapper.selectById(sessionId);
-        boolean revoked = session == null || session.isRevoked() || session.isExpired();
+        boolean revoked = session == null || session.isSessionRevoked() || session.isSessionExpired();
         try {
             if (ttlSeconds > 0) {
                 redisTemplate.opsForValue().set(key, revoked ? "1" : "0", Duration.ofSeconds(ttlSeconds));

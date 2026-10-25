@@ -113,7 +113,7 @@ public class TokenService {
             handleReplay(oldHash);
             throw new BizException(ErrorCode.REFRESH_TOKEN_INVALID);
         }
-        if (session.isRevoked() || session.isExpired()) {
+        if (session.isSessionRevoked() || session.isSessionExpired()) {
             throw new BizException(ErrorCode.REFRESH_TOKEN_INVALID, "session revoked or expired");
         }
         checkAccountStatus(session.getUserId(), true);
@@ -138,7 +138,7 @@ public class TokenService {
     /** 单会话吊销（登出 / 踢设备） */
     public void revokeSession(Long sessionId) {
         AuthSession session = authSessionMapper.selectById(sessionId);
-        if (session == null || session.isRevoked()) {
+        if (session == null || session.isSessionRevoked()) {
             return;
         }
         session.setRevoked(AuthSession.REVOKED);

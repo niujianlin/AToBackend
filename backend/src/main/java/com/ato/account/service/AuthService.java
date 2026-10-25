@@ -251,7 +251,7 @@ public class AuthService {
         if (session == null || !session.getUserId().equals(me.userId())) {
             throw new BizException(ErrorCode.SESSION_NOT_FOUND);
         }
-        if (session.isRevoked()) {
+        if (session.isSessionRevoked()) {
             throw new BizException(ErrorCode.SESSION_ALREADY_REVOKED);
         }
         tokenService.revokeSession(sessionId);
