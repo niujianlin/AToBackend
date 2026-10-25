@@ -50,7 +50,21 @@ jobs:
         run: mvn ${{ env.MAVEN_ARGS }} -DskipTests clean compile
 
       - name: Unit tests
-        run: mvn ${{ env.MAVEN_ARGS }} test
+        run: |
+          set -o pipefail
+          mvn ${{ env.MAVEN_ARGS }} test 2>&1 | tee /tmp/mvn-test.log
+
+      # 失败时把关键行转成 annotation：公开仓库可通过 check-runs API 匿名读取，
+      # 避免只依赖需要登录才能下载的 job 日志。
+      - name: Surface unit test failure
+        if: failure()
+        run: |
+          LOG=/tmp/mvn-test.log
+          if [ ! -f "$LOG" ]; then echo "::error title=unit-test::maven log not found"; exit 0; fi
+          SNIP=$(grep -E '^\[ERROR\]|Exception|Caused by|Tests run:|error:' "$LOG" | head -12 || true)
+          [ -n "$SNIP" ] || SNIP="no matching lines in maven log"
+          MSG=$(printf '%s\n' "$SNIP" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=unit-test-failure::${MSG}"
 
       - name: Package (fat jar)
         run: mvn ${{ env.MAVEN_ARGS }} -DskipTests package
@@ -234,4 +248,10 @@ jobs:
 
       - name: Dump app log on failure
         if: failure()
-        run: tail -200 /tmp/app.log || true
+        run: |
+          tail -200 /tmp/app.log || true
+          # 同时以 annotation 形式暴露堆栈，便于匿名通过 API 读取
+          SNIP=$(grep -A25 -E "unexpected error|APPLICATION FAILED TO START|BeanCreationException" /tmp/app.log 2>/dev/null | head -30 || true)
+          [ -n "$SNIP" ] || SNIP="no app error found"
+          MSG=$(printf '%s\n' "$SNIP" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=app-log::${MSG}"
