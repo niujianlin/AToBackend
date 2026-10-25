@@ -132,6 +132,9 @@ jobs:
     needs: [verify, image]
     if: github.event.inputs.skip_deploy != 'true'
     timeout-minutes: 15
+    # GITHUB_TOKEN 需要拉 GHCR 镜像的权限（镜像为 private 时必需）
+    permissions:
+      packages: read
     # 保护规则（人工审批 / 仅允许 tag）在仓库 Settings → Environments 里配置
     environment:
       name: production
@@ -186,7 +189,8 @@ jobs:
           docker compose ps --format '{{.Image}}' > .last_image 2>/dev/null || true
 
           docker compose pull ato-account
-          docker compose up -d --no-deps ato-account
+          # 不加 --no-deps：确保 mysql / redis 也按 compose 配置处于运行状态
+          docker compose up -d ato-account
 
           # 等待健康检查通过（最多 90s）
           for i in $(seq 1 45); do
@@ -216,7 +220,7 @@ jobs:
           PREV=$(cat .last_image 2>/dev/null | head -1 || true)
           if [ -n "$PREV" ]; then
             echo "回滚到: $PREV"
-            ATO_IMAGE="$PREV" docker compose up -d --no-deps ato-account
+            ATO_IMAGE="$PREV" docker compose up -d ato-account
           else
             echo "无可用回滚点，仅保留失败版本日志"
           fi

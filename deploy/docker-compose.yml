@@ -1,28 +1,106 @@
-# 生产部署编排：放到服务器 DEPLOY_PATH 下，与 .env 同目录
+# 生产部署编排：全容器化（应用 + MySQL 8 + Redis 7）
+# 放到服务器 DEPLOY_PATH 下，与 .env、initdb/ 同目录：
+#   docker-compose.yml
+#   .env                 （由 .env.example 复制而来）
+#   initdb/schema.sql    （首次启动自动建表）
+#
 # 镜像地址由 GitHub Actions 以 ATO_IMAGE 环境变量注入，例如：
 #   ATO_IMAGE=ghcr.io/<owner>/ato-account:v1.0.0
+#
+# 说明：
+#   1. MySQL / Redis 默认不映射宿主机端口，只在 compose 内网可达，
+#      需要临时管理时执行 docker compose exec mysql mysql -uato -p ato_account
+#   2. 若改用外部云数据库，请删除 mysql/redis 服务并把 DB_HOST / REDIS_HOST
+#      改为外部地址（同时删除 ato-account 的 depends_on）
 services:
+  mysql:
+    image: mysql:8.0
+    container_name: ato-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --max_connections=200
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${DB_NAME:-ato_account}
+      MYSQL_USER: ${DB_USER:-ato}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      TZ: UTC
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 仅当数据卷为空（首次启动）时执行，之后的表结构变更需手动执行迁移 SQL
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    # 使用 mysql:8.0 官方镜像自带的 healthcheck（mysqladmin ping）
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1', '-uroot', '-p${MYSQL_ROOT_PASSWORD}']
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: '50m'
+        max-file: '3'
+    # 内存紧张（<4G）的机器可放开下面的限制，避免 MySQL 抢占过多内存
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 1g
+
+  redis:
+    image: redis:7-alpine
+    container_name: ato-redis
+    restart: unless-stopped
+    # Redis 仅承载风控计数与会话吊销缓存，数据可丢；如需持久化把 no 改成 yes
+    command: ['redis-server', '--appendonly', 'no', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction']
+    environment:
+      # redis:7 镜像的 entrypoint 会把 REDIS_ARGS 追加到启动参数
+      REDIS_ARGS: --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: '20m'
+        max-file: '3'
+
   ato-account:
     image: ${ATO_IMAGE:?ATO_IMAGE is required}
     container_name: ato-account
     restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - .env
     environment:
-      # 容器内固定连宿主机的 MySQL / Redis（或改成外部地址）
-      DB_HOST: ${DB_HOST:-host.docker.internal}
-      DB_PORT: ${DB_PORT:-3306}
+      # 容器内通过 compose 服务名访问，不再走 host.docker.internal
+      DB_HOST: mysql
+      DB_PORT: 3306
       DB_NAME: ${DB_NAME:-ato_account}
-      REDIS_HOST: ${REDIS_HOST:-host.docker.internal}
-      REDIS_PORT: ${REDIS_PORT:-6379}
+      DB_USER: ${DB_USER:-ato}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_DB: ${REDIS_DB:-0}
       # 多实例部署时必须为每个实例分配不同值
       SNOWFLAKE_WORKER_ID: ${SNOWFLAKE_WORKER_ID:-1}
       # 注意：application.yml 中 ato.sms.mock 目前是硬编码 true，
       # 接入真实短信商后需改为 ${ATO_SMS_MOCK:false} 才能生效
     ports:
+      # 生产建议改为 '127.0.0.1:8080:8080'，由 Nginx/Caddy 反向代理并终止 HTTPS
       - '${APP_PORT:-8080}:8080'
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
     healthcheck:
       test: ['CMD', 'curl', '-fsS', '-o', '/dev/null', '-X', 'POST', 'http://127.0.0.1:8080/api/v1/auth/login']
       interval: 30s
@@ -38,3 +116,7 @@ services:
       resources:
         limits:
           memory: 1g
+
+volumes:
+  mysql-data:
+  redis-data:
